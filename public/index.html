@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RAG em execução</title>
+  <style>
+    :root { --ink: #17201d; --paper: #f7f8f7; --green: #176b52; --line: #d7dcd9; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: var(--paper); font: 16px/1.5 system-ui, sans-serif; }
+    main { width: min(1100px, calc(100% - 32px)); margin: 28px auto 64px; }
+    header { text-align: center; }
+    h1 { margin: 0; font-size: clamp(2.75rem, 6vw, 4.5rem); line-height: 1; letter-spacing: -.04em; }
+    #index-status { margin: 10px 0 0; color: #5c655f; font-size: .82rem; }
+    form { display: grid; grid-template-columns: 1fr auto; gap: 12px; margin: 20px 0 16px; }
+    input, button { border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+    #question { min-width: 0; padding: 14px; color: var(--ink); background: white; }
+    button { padding: 0 24px; border-color: var(--green); color: white; background: var(--green); font-weight: 700; cursor: pointer; }
+    button:hover { background: #115740; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .examples { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 24px; }
+    .examples button { padding: 6px 10px; border-color: var(--line); color: var(--ink); background: white; font-size: .8rem; font-weight: 600; }
+    .pipeline { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+    section { min-height: 250px; padding: 18px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+    .answer-panel { grid-column: 1 / -1; min-height: 160px; border-color: var(--green); }
+    h2 { display: flex; align-items: center; gap: 9px; margin: 0 0 16px; font-size: .9rem; font-weight: 700; }
+    h2 span { color: var(--green); }
+    .placeholder { color: #6b716d; font-style: italic; }
+    .source { margin: 0 0 10px; padding: 12px; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); }
+    .source summary { cursor: pointer; font-size: .8rem; font-weight: 700; }
+    .source summary span { float: right; }
+    .source p { margin: 8px 0 0; font-size: .88rem; }
+    pre { max-height: 360px; margin: 0; overflow: auto; white-space: pre-wrap; font: .8rem/1.5 system-ui, sans-serif; }
+    #answer { white-space: pre-wrap; font-size: 1.15rem; }
+    .error { color: #b51e2b; font-weight: 700; }
+    @media (min-width: 761px) {
+      html, body { height: 100%; overflow: hidden; }
+      main { display: flex; height: calc(100vh - 24px); margin-block: 12px; flex-direction: column; }
+      h1 { font-size: clamp(2.75rem, 7vh, 4.5rem); }
+      form { margin: 12px 0 10px; }
+      .examples { margin-bottom: 12px; }
+      .pipeline { min-height: 0; flex: 1; grid-template-rows: minmax(110px, .7fr) minmax(0, 1fr); }
+      section, .answer-panel { min-height: 0; overflow: auto; }
+      pre { max-height: none; }
+    }
+    @media (max-width: 760px) { form { grid-template-columns: 1fr; } button { min-height: 52px; } .pipeline { grid-template-columns: 1fr; } .answer-panel { grid-column: auto; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>RAG</h1>
+      <p id="index-status">Cloudflare Vectorize · índice persistente</p>
+    </header>
+
+    <form id="form">
+      <input id="question" aria-label="Pergunta" maxlength="500" required value="Como uma IA pode consultar dados privados atualizados sem ser retreinada?">
+      <button id="submit">Executar RAG</button>
+    </form>
+    <div class="examples">
+      <button data-question="Como uma IA pode consultar dados privados atualizados sem ser retreinada?">Exemplo RAG</button>
+      <button data-question="Por que a busca aproximada é usada e qual é o seu custo?">Exemplo ANN</button>
+      <button data-question="Qual banco vetorial é sempre o melhor para qualquer empresa?">Sem resposta</button>
+    </div>
+
+    <div class="pipeline">
+      <section class="answer-panel">
+        <h2><span>✓</span> Resposta gerada</h2>
+        <div id="answer" class="placeholder" aria-live="polite">A resposta fundamentada aparecerá aqui.</div>
+      </section>
+      <section>
+        <h2><span>1</span> Consulta no Vectorize</h2>
+        <div id="query" class="placeholder">Faça uma pergunta para gerar o embedding.</div>
+      </section>
+      <section>
+        <h2><span>2</span> Trechos recuperados</h2>
+        <div id="sources" class="placeholder">Os vizinhos mais próximos aparecerão aqui.</div>
+      </section>
+      <section>
+        <h2><span>3</span> Prompt enriquecido</h2>
+        <pre id="prompt" class="placeholder">O contexto será anexado à pergunta.</pre>
+      </section>
+    </div>
+  </main>
+  <script>
+    const form = document.querySelector('#form');
+    const input = document.querySelector('#question');
+    const indexStatus = document.querySelector('#index-status');
+    const submit = document.querySelector('#submit');
+    const query = document.querySelector('#query');
+    const sources = document.querySelector('#sources');
+    const prompt = document.querySelector('#prompt');
+    const answer = document.querySelector('#answer');
+    let indexReady = false;
+
+    document.querySelectorAll('[data-question]').forEach(button => {
+      button.addEventListener('click', () => { input.value = button.dataset.question; input.focus(); });
+    });
+
+    async function readResponse(response) {
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Falha desconhecida');
+      return data;
+    }
+
+    async function ensureIndex() {
+      if (indexReady) return;
+      indexStatus.textContent = 'Preparando índice no Vectorize...';
+      let data = await readResponse(await fetch('/api/index', { method: 'POST' }));
+      for (let attempt = 0; !data.ready && attempt < 30; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        data = await readResponse(await fetch('/api/index?check', { method: 'POST' }));
+      }
+      if (!data.ready) throw new Error('O índice não ficou disponível a tempo');
+      indexReady = true;
+      indexStatus.textContent = `${data.slides} slides persistidos no Vectorize`;
+    }
+
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      submit.disabled = true;
+      submit.textContent = 'Processando...';
+      query.className = '';
+      query.textContent = `“${input.value}”`;
+      sources.className = 'placeholder';
+      sources.textContent = 'Preparando o índice e buscando vizinhos...';
+      prompt.className = 'placeholder';
+      prompt.textContent = 'Aguardando recuperação...';
+      answer.className = 'placeholder';
+      answer.textContent = 'Consultando o modelo configurado...';
+
+      try {
+        await ensureIndex();
+        const response = await fetch('/api/ask', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: input.value })
+        });
+        const data = await readResponse(response);
+        sources.className = '';
+        sources.replaceChildren(...data.sources.map(item => {
+          const card = document.createElement('details');
+          card.className = 'source';
+          const heading = document.createElement('summary');
+          heading.append(`Slide ${item.slide}`);
+          const score = document.createElement('span');
+          score.textContent = `similaridade ${item.similarity.toFixed(2)}`;
+          heading.append(score);
+          const text = document.createElement('p');
+          text.textContent = item.text;
+          card.append(heading, text);
+          return card;
+        }));
+        prompt.className = '';
+        prompt.textContent = data.prompt;
+        answer.className = '';
+        answer.textContent = data.answer;
+      } catch (error) {
+        answer.className = 'error';
+        answer.textContent = error.message;
+      } finally {
+        submit.disabled = false;
+        submit.textContent = 'Executar RAG';
+      }
+    });
+  </script>
+</body>
+</html>
